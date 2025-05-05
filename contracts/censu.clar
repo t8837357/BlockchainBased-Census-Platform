@@ -87,3 +87,95 @@
         avg-age: new-avg-age,
         last-updated: stacks-block-height
       })))
+
+
+
+(define-map citizen-migrations
+  { citizen-id: uint }
+  {
+    from-region: (string-ascii 32),
+    to-region: (string-ascii 32),
+    transfer-height: uint
+  }
+)
+
+(define-public (transfer-citizen
+    (citizen-id uint)
+    (new-region (string-ascii 32)))
+  (let
+    ((citizen (unwrap! (map-get? citizens { citizen-id: citizen-id }) ERR-NOT-FOUND))
+     (old-region (get region citizen)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (map-set citizen-migrations
+        { citizen-id: citizen-id }
+        {
+          from-region: old-region,
+          to-region: new-region,
+          transfer-height: stacks-block-height
+        })
+      (map-set citizens
+        { citizen-id: citizen-id }
+        (merge citizen { region: new-region }))
+      (try! (decrease-region-population old-region))
+      (update-region-stats new-region (get birth-year citizen))
+      (ok true))))
+(define-private (decrease-region-population (region (string-ascii 32)))
+  (let
+    ((stats (unwrap! (map-get? region-stats { region: region }) ERR-NOT-FOUND)))
+    (ok (map-set region-stats
+      { region: region }
+      (merge stats { population: (- (get population stats) u1) })))))
+
+
+
+
+(define-map verifiers
+  { address: principal }
+  { active: bool }
+)
+
+(define-map citizen-attestations
+  { citizen-id: uint }
+  {
+    verifier: principal,
+    verification-height: uint,
+    verification-type: (string-ascii 16),
+    metadata: (string-ascii 128)
+  }
+)
+
+(define-public (add-verifier (verifier-address principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (ok (map-set verifiers
+      { address: verifier-address }
+      { active: true }))))
+
+(define-public (remove-verifier (verifier-address principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (ok (map-set verifiers
+      { address: verifier-address }
+      { active: false }))))
+
+(define-public (attest-citizen
+    (citizen-id uint)
+    (verification-type (string-ascii 16))
+    (metadata (string-ascii 128)))
+  (let
+    ((verifier-status (unwrap! (map-get? verifiers { address: tx-sender }) ERR-NOT-AUTHORIZED)))
+    (begin
+      (asserts! (get active verifier-status) ERR-NOT-AUTHORIZED)
+      (asserts! (is-some (map-get? citizens { citizen-id: citizen-id })) ERR-NOT-FOUND)
+      (ok (map-set citizen-attestations
+        { citizen-id: citizen-id }
+        {
+          verifier: tx-sender,
+          verification-height: stacks-block-height,
+          verification-type: verification-type,
+          metadata: metadata
+        })))))
+
+(define-read-only (get-citizen-attestation (citizen-id uint))
+  (map-get? citizen-attestations { citizen-id: citizen-id }))
