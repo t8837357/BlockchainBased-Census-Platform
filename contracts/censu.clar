@@ -26,6 +26,43 @@
 (define-constant ERR-INVALID-DATA (err u102))
 (define-constant ERR-NOT-FOUND (err u103))
 
+
+(define-constant ERR-VERIFICATION-EXPIRED (err u104))
+(define-constant ERR-INSUFFICIENT-VERIFICATION (err u105))
+(define-constant ERR-VERIFICATION-PENDING (err u106))
+
+(define-constant VERIFICATION-DOCUMENT u1)
+(define-constant VERIFICATION-BIOMETRIC u2)
+(define-constant VERIFICATION-WITNESS u3)
+
+(define-constant VERIFICATION-VALIDITY-BLOCKS u52560)
+
+(define-map citizen-verifications
+  { citizen-id: uint }
+  {
+    document-verified: bool,
+    biometric-verified: bool,
+    witness-verified: bool,
+    verification-score: uint,
+    last-verification: uint,
+    expires-at: uint
+  }
+)
+
+(define-map verification-requests
+  { request-id: uint }
+  {
+    citizen-id: uint,
+    verification-type: uint,
+    submitted-at: uint,
+    status: (string-ascii 16),
+    evidence-hash: (string-ascii 64)
+  }
+)
+
+(define-data-var next-request-id uint u1)
+
+
 (define-public (set-admin (new-admin principal))
   (begin
     (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
@@ -179,3 +216,134 @@
 
 (define-read-only (get-citizen-attestation (citizen-id uint))
   (map-get? citizen-attestations { citizen-id: citizen-id }))
+
+
+(define-public (submit-verification-request
+    (citizen-id uint)
+    (verification-type uint)
+    (evidence-hash (string-ascii 64)))
+  (let
+    ((request-id (var-get next-request-id)))
+    (begin
+      (asserts! (is-some (map-get? citizens { citizen-id: citizen-id })) ERR-NOT-FOUND)
+      (asserts! (<= verification-type u3) ERR-INVALID-DATA)
+      (asserts! (>= verification-type u1) ERR-INVALID-DATA)
+      (map-set verification-requests
+        { request-id: request-id }
+        {
+          citizen-id: citizen-id,
+          verification-type: verification-type,
+          submitted-at: stacks-block-height,
+          status: "pending",
+          evidence-hash: evidence-hash
+        })
+      (var-set next-request-id (+ request-id u1))
+      (ok request-id))))
+
+(define-public (approve-verification-request (request-id uint))
+  (let
+    ((request (unwrap! (map-get? verification-requests { request-id: request-id }) ERR-NOT-FOUND))
+     (citizen-id (get citizen-id request))
+     (verification-type (get verification-type request))
+     (current-verification (default-to
+       { document-verified: false, biometric-verified: false, witness-verified: false, verification-score: u0, last-verification: u0, expires-at: u0 }
+       (map-get? citizen-verifications { citizen-id: citizen-id }))))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (is-eq (get status request) "pending") ERR-INVALID-DATA)
+      (map-set verification-requests
+        { request-id: request-id }
+        (merge request { status: "approved" }))
+      (if (is-eq verification-type VERIFICATION-DOCUMENT)
+        (update-citizen-verification citizen-id (merge current-verification { document-verified: true }))
+        (if (is-eq verification-type VERIFICATION-BIOMETRIC)
+          (update-citizen-verification citizen-id (merge current-verification { biometric-verified: true }))
+          (update-citizen-verification citizen-id (merge current-verification { witness-verified: true }))))
+      (ok true))))
+
+(define-public (reject-verification-request (request-id uint))
+  (let
+    ((request (unwrap! (map-get? verification-requests { request-id: request-id }) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (is-eq (get status request) "pending") ERR-INVALID-DATA)
+      (ok (map-set verification-requests
+        { request-id: request-id }
+        (merge request { status: "rejected" }))))))
+
+(define-private (update-citizen-verification
+    (citizen-id uint)
+    (verification-data { document-verified: bool, biometric-verified: bool, witness-verified: bool, verification-score: uint, last-verification: uint, expires-at: uint }))
+  (let
+    ((new-score (calculate-verification-score verification-data))
+     (current-block stacks-block-height)
+     (expiry-block (+ current-block VERIFICATION-VALIDITY-BLOCKS)))
+    (map-set citizen-verifications
+      { citizen-id: citizen-id }
+      (merge verification-data {
+        verification-score: new-score,
+        last-verification: current-block,
+        expires-at: expiry-block
+      }))))
+
+(define-private (calculate-verification-score
+    (verification-data { document-verified: bool, biometric-verified: bool, witness-verified: bool, verification-score: uint, last-verification: uint, expires-at: uint }))
+  (let
+    ((document-score (if (get document-verified verification-data) u40 u0))
+     (biometric-score (if (get biometric-verified verification-data) u40 u0))
+     (witness-score (if (get witness-verified verification-data) u20 u0)))
+    (+ document-score (+ biometric-score witness-score))))
+
+(define-public (register-verified-citizen
+    (name (string-ascii 64))
+    (birth-year uint)
+    (region (string-ascii 32))
+    (min-verification-score uint))
+  (let
+    ((citizen-id (+ (var-get total-citizens) u1))
+     (verification (map-get? citizen-verifications { citizen-id: citizen-id })))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (> birth-year u1900) ERR-INVALID-DATA)
+      (if (> min-verification-score u0)
+        (begin
+          (asserts! (is-some verification) ERR-INSUFFICIENT-VERIFICATION)
+          (asserts! (>= (get verification-score (unwrap-panic verification)) min-verification-score) ERR-INSUFFICIENT-VERIFICATION)
+          (asserts! (> (get expires-at (unwrap-panic verification)) stacks-block-height) ERR-VERIFICATION-EXPIRED))
+        true)
+      (map-set citizens
+        { citizen-id: citizen-id }
+        {
+          name: name,
+          birth-year: birth-year,
+          region: region,
+          registered: stacks-block-height,
+          status: "verified"
+        })
+      (var-set total-citizens citizen-id)
+      (update-region-stats region birth-year)
+      (ok citizen-id))))
+
+(define-read-only (get-citizen-verification (citizen-id uint))
+  (map-get? citizen-verifications { citizen-id: citizen-id }))
+
+(define-read-only (get-verification-request (request-id uint))
+  (map-get? verification-requests { request-id: request-id }))
+
+(define-read-only (is-citizen-verified (citizen-id uint) (min-score uint))
+  (match (map-get? citizen-verifications { citizen-id: citizen-id })
+    verification (and 
+      (>= (get verification-score verification) min-score)
+      (> (get expires-at verification) stacks-block-height))
+    false))
+
+(define-read-only (get-verification-status (citizen-id uint))
+  (match (map-get? citizen-verifications { citizen-id: citizen-id })
+    verification {
+      score: (get verification-score verification),
+      expired: (<= (get expires-at verification) stacks-block-height),
+      document: (get document-verified verification),
+      biometric: (get biometric-verified verification),
+      witness: (get witness-verified verification)
+    }
+    { score: u0, expired: true, document: false, biometric: false, witness: false }))
