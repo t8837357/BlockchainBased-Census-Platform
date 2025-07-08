@@ -21,6 +21,80 @@
   }
 )
 
+
+(define-constant REWARD-REGISTRATION u50)
+(define-constant REWARD-VERIFICATION u100)
+(define-constant REWARD-REFERRAL u30)
+(define-constant REWARD-DATA-UPDATE u25)
+(define-constant REWARD-COMMUNITY-PARTICIPATION u40)
+
+(define-constant LEVEL-BRONZE u100)
+(define-constant LEVEL-SILVER u500)
+(define-constant LEVEL-GOLD u1000)
+(define-constant LEVEL-PLATINUM u2000)
+
+(define-constant ERR-INSUFFICIENT-POINTS (err u107))
+(define-constant ERR-INVALID-REWARD-TYPE (err u108))
+(define-constant ERR-REWARD-ALREADY-CLAIMED (err u109))
+(define-constant ERR-COOLDOWN-ACTIVE (err u110))
+
+(define-map citizen-rewards
+  { citizen-id: uint }
+  {
+    total-points: uint,
+    level: (string-ascii 16),
+    referrals-made: uint,
+    last-data-update: uint,
+    last-participation: uint,
+    achievements: (list 10 (string-ascii 32))
+  }
+)
+
+(define-map reward-activities
+  { citizen-id: uint, activity-type: (string-ascii 32) }
+  {
+    timestamp: uint,
+    points-earned: uint,
+    details: (string-ascii 128)
+  }
+)
+
+(define-map reward-redemptions
+  { citizen-id: uint, redemption-id: uint }
+  {
+    points-spent: uint,
+    benefit-type: (string-ascii 32),
+    redeemed-at: uint,
+    status: (string-ascii 16)
+  }
+)
+
+(define-map benefit-catalog
+  { benefit-id: uint }
+  {
+    name: (string-ascii 64),
+    description: (string-ascii 128),
+    cost: uint,
+    category: (string-ascii 32),
+    available: bool
+  }
+)
+
+(define-data-var next-redemption-id uint u1)
+(define-data-var total-rewards-distributed uint u0)
+
+(define-private (initialize-citizen-rewards (citizen-id uint))
+  (map-set citizen-rewards
+    { citizen-id: citizen-id }
+    {
+      total-points: u0,
+      level: "bronze",
+      referrals-made: u0,
+      last-data-update: u0,
+      last-participation: u0,
+      achievements: (list)
+    }))
+
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-ALREADY-REGISTERED (err u101))
 (define-constant ERR-INVALID-DATA (err u102))
@@ -347,3 +421,179 @@
       witness: (get witness-verified verification)
     }
     { score: u0, expired: true, document: false, biometric: false, witness: false }))
+
+
+(define-private (award-points (citizen-id uint) (points uint) (activity-type (string-ascii 32)) (details (string-ascii 128)))
+  (let
+    ((current-rewards (default-to
+      { total-points: u0, level: "bronze", referrals-made: u0, last-data-update: u0, last-participation: u0, achievements: (list) }
+      (map-get? citizen-rewards { citizen-id: citizen-id })))
+     (new-total (+ (get total-points current-rewards) points))
+     (new-level (calculate-level new-total)))
+    (begin
+      (map-set citizen-rewards
+        { citizen-id: citizen-id }
+        (merge current-rewards {
+          total-points: new-total,
+          level: new-level
+        }))
+      (map-set reward-activities
+        { citizen-id: citizen-id, activity-type: activity-type }
+        {
+          timestamp: stacks-block-height,
+          points-earned: points,
+          details: details
+        })
+      (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) points))
+      new-total)))
+
+(define-private (calculate-level (total-points uint))
+  (if (>= total-points LEVEL-PLATINUM)
+    "platinum"
+    (if (>= total-points LEVEL-GOLD)
+      "gold"
+      (if (>= total-points LEVEL-SILVER)
+        "silver"
+        "bronze"))))
+
+(define-public (claim-registration-reward (citizen-id uint))
+  (let
+    ((citizen (unwrap! (map-get? citizens { citizen-id: citizen-id }) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (is-none (map-get? reward-activities { citizen-id: citizen-id, activity-type: "registration" })) ERR-REWARD-ALREADY-CLAIMED)
+      (award-points citizen-id REWARD-REGISTRATION "registration" "Initial registration reward")
+      (ok true))))
+
+(define-public (claim-verification-reward (citizen-id uint))
+  (let
+    ((verification (unwrap! (map-get? citizen-verifications { citizen-id: citizen-id }) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (>= (get verification-score verification) u60) ERR-INSUFFICIENT-VERIFICATION)
+      (asserts! (is-none (map-get? reward-activities { citizen-id: citizen-id, activity-type: "verification" })) ERR-REWARD-ALREADY-CLAIMED)
+      (award-points citizen-id REWARD-VERIFICATION "verification" "Successful identity verification")
+      (ok true))))
+
+(define-public (claim-referral-reward (referrer-id uint) (referee-id uint))
+  (let
+    ((referrer (unwrap! (map-get? citizens { citizen-id: referrer-id }) ERR-NOT-FOUND))
+     (referee (unwrap! (map-get? citizens { citizen-id: referee-id }) ERR-NOT-FOUND))
+     (referrer-rewards (default-to
+       { total-points: u0, level: "bronze", referrals-made: u0, last-data-update: u0, last-participation: u0, achievements: (list) }
+       (map-get? citizen-rewards { citizen-id: referrer-id }))))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (not (is-eq referrer-id referee-id)) ERR-INVALID-DATA)
+      (map-set citizen-rewards
+        { citizen-id: referrer-id }
+        (merge referrer-rewards { referrals-made: (+ (get referrals-made referrer-rewards) u1) }))
+      (award-points referrer-id REWARD-REFERRAL "referral" "Successfully referred new citizen")
+      (ok true))))
+
+(define-public (claim-data-update-reward (citizen-id uint))
+  (let
+    ((citizen (unwrap! (map-get? citizens { citizen-id: citizen-id }) ERR-NOT-FOUND))
+     (current-rewards (default-to
+       { total-points: u0, level: "bronze", referrals-made: u0, last-data-update: u0, last-participation: u0, achievements: (list) }
+       (map-get? citizen-rewards { citizen-id: citizen-id })))
+     (cooldown-blocks u1440)
+     (current-block stacks-block-height))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (or (is-eq (get last-data-update current-rewards) u0) 
+                    (>= (- current-block (get last-data-update current-rewards)) cooldown-blocks)) ERR-COOLDOWN-ACTIVE)
+      (map-set citizen-rewards
+        { citizen-id: citizen-id }
+        (merge current-rewards { last-data-update: current-block }))
+      (award-points citizen-id REWARD-DATA-UPDATE "data-update" "Updated census information")
+      (ok true))))
+
+(define-public (claim-participation-reward (citizen-id uint) (activity-description (string-ascii 128)))
+  (let
+    ((citizen (unwrap! (map-get? citizens { citizen-id: citizen-id }) ERR-NOT-FOUND))
+     (current-rewards (default-to
+       { total-points: u0, level: "bronze", referrals-made: u0, last-data-update: u0, last-participation: u0, achievements: (list) }
+       (map-get? citizen-rewards { citizen-id: citizen-id })))
+     (cooldown-blocks u2160)
+     (current-block stacks-block-height))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (or (is-eq (get last-participation current-rewards) u0) 
+                    (>= (- current-block (get last-participation current-rewards)) cooldown-blocks)) ERR-COOLDOWN-ACTIVE)
+      (map-set citizen-rewards
+        { citizen-id: citizen-id }
+        (merge current-rewards { last-participation: current-block }))
+      (award-points citizen-id REWARD-COMMUNITY-PARTICIPATION "participation" activity-description)
+      (ok true))))
+
+(define-public (setup-benefit (benefit-id uint) (name (string-ascii 64)) (description (string-ascii 128)) (cost uint) (category (string-ascii 32)))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (ok (map-set benefit-catalog
+      { benefit-id: benefit-id }
+      {
+        name: name,
+        description: description,
+        cost: cost,
+        category: category,
+        available: true
+      }))))
+
+(define-public (redeem-benefit (citizen-id uint) (benefit-id uint))
+  (let
+    ((citizen (unwrap! (map-get? citizens { citizen-id: citizen-id }) ERR-NOT-FOUND))
+     (benefit (unwrap! (map-get? benefit-catalog { benefit-id: benefit-id }) ERR-NOT-FOUND))
+     (current-rewards (unwrap! (map-get? citizen-rewards { citizen-id: citizen-id }) ERR-NOT-FOUND))
+     (redemption-id (var-get next-redemption-id)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (get available benefit) ERR-INVALID-DATA)
+      (asserts! (>= (get total-points current-rewards) (get cost benefit)) ERR-INSUFFICIENT-POINTS)
+      (map-set citizen-rewards
+        { citizen-id: citizen-id }
+        (merge current-rewards { total-points: (- (get total-points current-rewards) (get cost benefit)) }))
+      (map-set reward-redemptions
+        { citizen-id: citizen-id, redemption-id: redemption-id }
+        {
+          points-spent: (get cost benefit),
+          benefit-type: (get category benefit),
+          redeemed-at: stacks-block-height,
+          status: "active"
+        })
+      (var-set next-redemption-id (+ redemption-id u1))
+      (ok redemption-id))))
+
+(define-public (toggle-benefit-availability (benefit-id uint))
+  (let
+    ((benefit (unwrap! (map-get? benefit-catalog { benefit-id: benefit-id }) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (ok (map-set benefit-catalog
+        { benefit-id: benefit-id }
+        (merge benefit { available: (not (get available benefit)) }))))))
+
+(define-read-only (get-citizen-rewards (citizen-id uint))
+  (map-get? citizen-rewards { citizen-id: citizen-id }))
+
+(define-read-only (get-reward-activity (citizen-id uint) (activity-type (string-ascii 32)))
+  (map-get? reward-activities { citizen-id: citizen-id, activity-type: activity-type }))
+
+(define-read-only (get-benefit-details (benefit-id uint))
+  (map-get? benefit-catalog { benefit-id: benefit-id }))
+
+(define-read-only (get-redemption-details (citizen-id uint) (redemption-id uint))
+  (map-get? reward-redemptions { citizen-id: citizen-id, redemption-id: redemption-id }))
+
+(define-read-only (get-total-rewards-distributed)
+  (var-get total-rewards-distributed))
+
+(define-read-only (get-citizen-level (citizen-id uint))
+  (match (map-get? citizen-rewards { citizen-id: citizen-id })
+    rewards (get level rewards)
+    "bronze"))
+
+(define-read-only (get-leaderboard-position (citizen-id uint))
+  (match (map-get? citizen-rewards { citizen-id: citizen-id })
+    rewards (get total-points rewards)
+    u0))
