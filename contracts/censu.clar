@@ -597,3 +597,375 @@
   (match (map-get? citizen-rewards { citizen-id: citizen-id })
     rewards (get total-points rewards)
     u0))
+
+;; Census Data Analytics & Reporting System
+
+(define-constant REPORT-DEMOGRAPHIC u1)
+(define-constant REPORT-REGIONAL u2)
+(define-constant REPORT-TEMPORAL u3)
+(define-constant REPORT-QUALITY u4)
+
+(define-constant ACCESS-GOVERNMENT u1)
+(define-constant ACCESS-RESEARCHER u2)
+(define-constant ACCESS-PUBLIC u3)
+
+(define-constant ERR-INVALID-REPORT-TYPE (err u111))
+(define-constant ERR-UNAUTHORIZED-ACCESS (err u112))
+(define-constant ERR-REPORT-NOT-FOUND (err u113))
+(define-constant ERR-INVALID-TIME-RANGE (err u114))
+
+;; Store generated reports with metadata
+(define-map census-reports
+  { report-id: uint }
+  {
+    report-type: uint,
+    generated-by: principal,
+    generated-at: uint,
+    region-filter: (optional (string-ascii 32)),
+    time-from: uint,
+    time-to: uint,
+    access-level: uint,
+    data-hash: (string-ascii 64),
+    title: (string-ascii 128)
+  }
+)
+
+;; Track analytical insights and metrics
+(define-map demographic-insights
+  { region: (string-ascii 32), period: uint }
+  {
+    total-population: uint,
+    average-age: uint,
+    age-groups: (list 5 uint), ;; [0-18, 19-35, 36-50, 51-65, 65+]
+    growth-rate: int,
+    verification-rate: uint,
+    data-completeness: uint
+  }
+)
+
+;; Store stakeholder access permissions
+(define-map stakeholder-access
+  { stakeholder: principal }
+  {
+    access-level: uint,
+    authorized-regions: (list 10 (string-ascii 32)),
+    access-granted-by: principal,
+    access-granted-at: uint,
+    active: bool
+  }
+)
+
+;; Track data quality metrics
+(define-map quality-metrics
+  { region: (string-ascii 32), timestamp: uint }
+  {
+    completeness-score: uint,
+    accuracy-score: uint,
+    timeliness-score: uint,
+    consistency-score: uint,
+    overall-quality: uint,
+    issues-detected: uint
+  }
+)
+
+(define-data-var next-report-id uint u1)
+(define-data-var analytics-enabled bool true)
+
+;; Generate demographic report for specified region and time period
+(define-public (generate-demographic-report 
+    (region (optional (string-ascii 32)))
+    (time-from uint)
+    (time-to uint)
+    (access-level uint)
+    (title (string-ascii 128)))
+  (let
+    ((report-id (var-get next-report-id))
+     (current-time stacks-block-height))
+    (begin
+      (asserts! (var-get analytics-enabled) ERR-NOT-AUTHORIZED)
+      (asserts! (<= time-from time-to) ERR-INVALID-TIME-RANGE)
+      (asserts! (<= access-level u3) ERR-INVALID-DATA)
+      
+      ;; Generate insights for the specified parameters
+      (unwrap! (if (is-some region)
+        (calculate-regional-demographics (unwrap-panic region) time-from time-to)
+        (calculate-global-demographics time-from time-to)) ERR-INVALID-DATA)
+      
+      ;; Store report metadata
+      (map-set census-reports
+        { report-id: report-id }
+        {
+          report-type: REPORT-DEMOGRAPHIC,
+          generated-by: tx-sender,
+          generated-at: current-time,
+          region-filter: region,
+          time-from: time-from,
+          time-to: time-to,
+          access-level: access-level,
+          data-hash: "demographic-analysis", ;; In real implementation, this would be computed
+          title: title
+        })
+      
+      (var-set next-report-id (+ report-id u1))
+      (ok report-id))))
+
+;; Generate regional comparison report
+(define-public (generate-regional-report
+    (regions (list 10 (string-ascii 32)))
+    (comparison-metrics (list 5 (string-ascii 16)))
+    (time-period uint)
+    (title (string-ascii 128)))
+  (let
+    ((report-id (var-get next-report-id))
+     (current-time stacks-block-height))
+    (begin
+      (asserts! (var-get analytics-enabled) ERR-NOT-AUTHORIZED)
+      (asserts! (> (len regions) u0) ERR-INVALID-DATA)
+      
+      ;; Calculate metrics for each region
+      (unwrap! (process-regional-comparisons regions time-period) ERR-INVALID-DATA)
+      
+      (map-set census-reports
+        { report-id: report-id }
+        {
+          report-type: REPORT-REGIONAL,
+          generated-by: tx-sender,
+          generated-at: current-time,
+          region-filter: none,
+          time-from: time-period,
+          time-to: current-time,
+          access-level: ACCESS-GOVERNMENT,
+          data-hash: "regional-comparison",
+          title: title
+        })
+      
+      (var-set next-report-id (+ report-id u1))
+      (ok report-id))))
+
+;; Generate temporal trend analysis
+(define-public (generate-temporal-report
+    (region (string-ascii 32))
+    (start-period uint)
+    (end-period uint)
+    (interval-blocks uint)
+    (title (string-ascii 128)))
+  (let
+    ((report-id (var-get next-report-id))
+     (current-time stacks-block-height))
+    (begin
+      (asserts! (var-get analytics-enabled) ERR-NOT-AUTHORIZED)
+      (asserts! (< start-period end-period) ERR-INVALID-TIME-RANGE)
+      (asserts! (> interval-blocks u0) ERR-INVALID-DATA)
+      
+      ;; Calculate trends over time periods
+      (unwrap! (calculate-temporal-trends region start-period end-period interval-blocks) ERR-INVALID-DATA)
+      
+      (map-set census-reports
+        { report-id: report-id }
+        {
+          report-type: REPORT-TEMPORAL,
+          generated-by: tx-sender,
+          generated-at: current-time,
+          region-filter: (some region),
+          time-from: start-period,
+          time-to: end-period,
+          access-level: ACCESS-RESEARCHER,
+          data-hash: "temporal-trends",
+          title: title
+        })
+      
+      (var-set next-report-id (+ report-id u1))
+      (ok report-id))))
+
+;; Grant access to stakeholders for specific regions and access levels
+(define-public (grant-stakeholder-access
+    (stakeholder principal)
+    (access-level uint)
+    (authorized-regions (list 10 (string-ascii 32))))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= access-level u3) ERR-INVALID-DATA)
+    (asserts! (> access-level u0) ERR-INVALID-DATA)
+    
+    (ok (map-set stakeholder-access
+      { stakeholder: stakeholder }
+      {
+        access-level: access-level,
+        authorized-regions: authorized-regions,
+        access-granted-by: tx-sender,
+        access-granted-at: stacks-block-height,
+        active: true
+      }))))
+
+;; Revoke stakeholder access
+(define-public (revoke-stakeholder-access (stakeholder principal))
+  (let
+    ((access-info (unwrap! (map-get? stakeholder-access { stakeholder: stakeholder }) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (ok (map-set stakeholder-access
+        { stakeholder: stakeholder }
+        (merge access-info { active: false }))))))
+
+;; Calculate regional demographics for specified time period
+(define-private (calculate-regional-demographics 
+    (region (string-ascii 32))
+    (time-from uint)
+    (time-to uint))
+  (let
+    ((current-region-stats (unwrap! (map-get? region-stats { region: region }) ERR-NOT-FOUND))
+     (current-year u2024)
+     (period-key (/ (+ time-from time-to) u2))) ;; Use midpoint as period key
+    (begin
+      ;; Calculate age distribution (simplified)
+      (let
+        ((age-groups (calculate-age-distribution region current-year))
+         (verification-rate (calculate-verification-rate region))
+         (growth-rate (calculate-growth-rate region time-from time-to)))
+        
+        (map-set demographic-insights
+          { region: region, period: period-key }
+          {
+            total-population: (get population current-region-stats),
+            average-age: (get avg-age current-region-stats),
+            age-groups: age-groups,
+            growth-rate: growth-rate,
+            verification-rate: verification-rate,
+            data-completeness: u95 ;; Placeholder calculation
+          })
+        (ok true)))))
+
+;; Calculate global demographics across all regions
+(define-private (calculate-global-demographics (time-from uint) (time-to uint))
+  (let
+    ((global-population (var-get total-citizens))
+     (period-key (/ (+ time-from time-to) u2)))
+    (begin
+      ;; Store global insights using "GLOBAL" as region identifier
+      (map-set demographic-insights
+        { region: "GLOBAL", period: period-key }
+        {
+          total-population: global-population,
+          average-age: u35, ;; Global average placeholder
+          age-groups: (list u20 u25 u20 u15 u10), ;; Age distribution percentages
+          growth-rate: 3, ;; 3% growth
+          verification-rate: u78,
+          data-completeness: u92
+        })
+      (ok true))))
+
+;; Process regional comparisons for multiple regions
+(define-private (process-regional-comparisons 
+    (regions (list 10 (string-ascii 32)))
+    (time-period uint))
+  (begin
+    ;; In a full implementation, this would iterate through regions
+    ;; For now, we'll simulate processing
+    (ok true)))
+
+;; Calculate temporal trends for a region over time
+(define-private (calculate-temporal-trends
+    (region (string-ascii 32))
+    (start-period uint)
+    (end-period uint)
+    (interval-blocks uint))
+  (begin
+    ;; Generate trend data for the specified time range
+    ;; This would involve analyzing historical data at regular intervals
+    (ok true)))
+
+;; Helper function to calculate age distribution
+(define-private (calculate-age-distribution 
+    (region (string-ascii 32))
+    (current-year uint))
+  (let
+    ((placeholder-distribution (list u25 u30 u20 u15 u10))) ;; Age group percentages
+    placeholder-distribution))
+
+;; Helper function to calculate verification rate for a region
+(define-private (calculate-verification-rate (region (string-ascii 32)))
+  (let
+    ((placeholder-rate u82)) ;; 82% verification rate
+    placeholder-rate))
+
+;; Helper function to calculate population growth rate
+(define-private (calculate-growth-rate 
+    (region (string-ascii 32))
+    (time-from uint)
+    (time-to uint))
+  (let
+    ((placeholder-growth 2)) ;; 2% growth rate
+    placeholder-growth))
+
+;; Record data quality metrics for a region
+(define-public (record-quality-metrics
+    (region (string-ascii 32))
+    (completeness uint)
+    (accuracy uint)
+    (timeliness uint)
+    (consistency uint))
+  (let
+    ((overall-quality (/ (+ completeness (+ accuracy (+ timeliness consistency))) u4))
+     (timestamp stacks-block-height))
+    (begin
+      (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+      (asserts! (<= completeness u100) ERR-INVALID-DATA)
+      (asserts! (<= accuracy u100) ERR-INVALID-DATA)
+      (asserts! (<= timeliness u100) ERR-INVALID-DATA)
+      (asserts! (<= consistency u100) ERR-INVALID-DATA)
+      
+      (ok (map-set quality-metrics
+        { region: region, timestamp: timestamp }
+        {
+          completeness-score: completeness,
+          accuracy-score: accuracy,
+          timeliness-score: timeliness,
+          consistency-score: consistency,
+          overall-quality: overall-quality,
+          issues-detected: (if (< overall-quality u80) u1 u0)
+        })))))
+
+;; Toggle analytics system on/off
+(define-public (toggle-analytics (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (ok (var-set analytics-enabled enabled))))
+
+;; Read-only functions for accessing analytics data
+
+(define-read-only (get-report-details (report-id uint))
+  (map-get? census-reports { report-id: report-id }))
+
+(define-read-only (get-demographic-insights (region (string-ascii 32)) (period uint))
+  (map-get? demographic-insights { region: region, period: period }))
+
+(define-read-only (get-stakeholder-access (stakeholder principal))
+  (map-get? stakeholder-access { stakeholder: stakeholder }))
+
+(define-read-only (get-quality-metrics (region (string-ascii 32)) (timestamp uint))
+  (map-get? quality-metrics { region: region, timestamp: timestamp }))
+
+(define-read-only (check-report-access (stakeholder principal) (report-id uint))
+  (let
+    ((report (map-get? census-reports { report-id: report-id }))
+     (access-info (map-get? stakeholder-access { stakeholder: stakeholder })))
+    (match report
+      report-data (match access-info
+        access (and
+          (get active access)
+          (>= (get access-level access) (get access-level report-data)))
+        false)
+      false)))
+
+(define-read-only (get-analytics-status)
+  (var-get analytics-enabled))
+
+(define-read-only (get-next-report-id)
+  (var-get next-report-id))
+
+
+
+
+
+
+
